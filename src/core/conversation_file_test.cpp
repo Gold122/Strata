@@ -14,6 +14,7 @@
 #include <fstream>
 #include <string>
 #include <new>
+#include <optional>
 #include <utility>
 #include <vector>
 #ifndef _WIN32
@@ -22,6 +23,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
+#ifdef __linux__
+#include <fcntl.h>
 #endif
 
 using namespace strata::core;
@@ -194,6 +198,38 @@ bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expec
     }
     return !ok && !error.empty();
 }
+
+#if defined(__linux__) && defined(O_DIRECT)
+bool direct_reads_supported(const fs::path& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (fd < 0) return false;
+    void* block = std::aligned_alloc(4096, 4096);
+    const bool ok = block && ::pread(fd, block, 4096, 0) == 4096;
+    std::free(block);
+    ::close(fd);
+    return ok;
+}
+
+std::optional<bool> session_reader_is_direct(const fs::path& path, const fs::path& descriptors = "/proc/self/fd") {
+    struct stat target {};
+    if (::stat(path.c_str(), &target) != 0) return false;
+    bool found = false;
+    std::error_code ec;
+    fs::directory_iterator it(descriptors, ec), end;
+    if (ec) return std::nullopt;   // Linux chroots need not mount procfs.
+    for (; it != end; it.increment(ec)) {
+        if (ec) return std::nullopt;
+        const int fd = std::atoi(it->path().filename().string().c_str());
+        struct stat file {};
+        if (::fstat(fd, &file) != 0 || file.st_dev != target.st_dev || file.st_ino != target.st_ino) continue;
+        const int flags = ::fcntl(fd, F_GETFL);
+        if (flags < 0 || !(flags & O_DIRECT)) return false;
+        found = true;
+    }
+    if (ec) return std::nullopt;
+    return found;
+}
+#endif
 } // namespace
 
 int main() {
@@ -209,6 +245,9 @@ int main() {
     std::string error;
     check(session_file_write(good.string(), original, id, written, error), "write succeeds");
     check(error.empty(), "write leaves no error");
+#if defined(__linux__) && defined(O_DIRECT)
+    check(!session_reader_is_direct(good, dir / "no-procfs").has_value(), "descriptor probe skips unavailable procfs");
+#endif
 
     // golden: format v1 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
     // fixed offsets, and a fixed hash of the whole file); a format change must bump the version and this test.
@@ -938,7 +977,38 @@ int main() {
         std::vector<std::vector<uint8_t>> got; std::vector<int> done(3, 0), touched(3, 0);
         std::vector<SessionKvSink> sinks = stub_sinks(kv, got, done, touched);
         SessionStatus kst; std::string ke;
-        check(session_file_restore_kv(sp.string(), id, sinks, ke, rl, &kst), "restore_kv streams");
+        // Format v1 interleaves unaligned headers and payloads. They must not turn a supported direct
+        // read into buffered I/O, or re-read the block the metadata parser already fetched.
+        std::vector<std::pair<uint64_t, uint64_t>> reads;
+        SessionReadLimits stream_limits = rl;
+        stream_limits.progress = [&](uint64_t done_bytes, uint64_t total) { reads.push_back({done_bytes, total}); };
+#if defined(__linux__) && defined(O_DIRECT)
+        const char* buffered = std::getenv("STRATA_SESSION_BUFFERED");
+        const bool expect_direct = !(buffered && buffered[0] == '1') && direct_reads_supported(sp);
+        bool remained_direct = true, descriptors_available = true;
+        for (auto& sink : sinks) {
+            auto write = sink.write;
+            sink.write = [&, write](size_t part, size_t at, const void* src, size_t n) {
+                if (expect_direct) {
+                    const auto direct = session_reader_is_direct(sp);
+                    if (direct) remained_direct = remained_direct && *direct;
+                    else descriptors_available = false;
+                }
+                return write(part, at, src, n);
+            };
+        }
+#endif
+        check(session_file_restore_kv(sp.string(), id, sinks, ke, stream_limits, &kst), "restore_kv streams");
+#if defined(__linux__) && defined(O_DIRECT)
+        if (expect_direct && (descriptors_available || !remained_direct))
+            check(remained_direct, "streaming restore retains supported O_DIRECT across unaligned parts");
+        else std::printf("  direct restore flag check skipped: forced buffered I/O, no O_DIRECT, or procfs unavailable\n");
+#endif
+        const uint64_t block = 16u << 20;
+        bool aligned_reads = reads.size() == (sb + block - 1) / block;
+        for (size_t i = 0; i < reads.size(); ++i)
+            aligned_reads = aligned_reads && reads[i] == std::make_pair(std::min<uint64_t>((i + 1) * block, sb), uint64_t(sb));
+        check(aligned_reads, "streaming restore reads each aligned block once, including its trailer");
         bool bytes_equal = true;
         for (size_t j = 0; j < kv.size() && bytes_equal; ++j) {
             const std::array<size_t, 5> sz = {kv[j].k.size(), kv[j].v.size(), kv[j].k_scale.size(),
@@ -1030,6 +1100,35 @@ int main() {
         check(!session_file_restore_meta(sp.string(), id, parsed, pb, pe, no_room, &pst) &&
               pst.error == SessionError::memory && pe.find("no RAM") != std::string::npos,
               "restore_meta's RAM refusal is 'memory'");
+    }
+
+    {   // Empty/tiny parts and the 16 MiB boundary share the reader with headers and the final trailer.
+        for (size_t n : {size_t(0), size_t(1), size_t(4095), size_t(4096), (16u << 20) - size_t(4096),
+                         (16u << 20) + size_t(7)}) {
+            SavedConversation s;
+            s.geometry = original.geometry;
+            s.layer_hi = 1;
+            s.live = checkpoint(37, 1);
+            ConversationKv k;
+            k.format = 2; k.cells = 1024; k.heads = 2; k.head_dim = 256; k.page_size = 64;
+            k.k = pattern(n, 11); k.v = pattern(13, 22); k.v_scale = pattern(1, 33);
+            std::vector<ConversationKv> kv{std::move(k)};
+            const fs::path p = dir / "stream-boundary.sess";
+            size_t bytes = 0;
+            check(session_file_write(p.string(), s, stub_sources(kv), id, bytes, error), "write stream boundary sample");
+            std::vector<std::vector<uint8_t>> got;
+            std::vector<int> done(1, 0), touched(1, 0);
+            auto sinks = stub_sinks(kv, got, done, touched);
+            check(session_file_restore_kv(p.string(), id, sinks, error, {}), "restore empty/tiny/unaligned stream parts");
+            bool equal = done[0] == 1;
+            const ConversationBuffer* parts[] = {&kv[0].k, &kv[0].v, &kv[0].k_scale, &kv[0].v_scale, &kv[0].pooled};
+            for (size_t part = 0; part < 5; ++part)
+                parts[part]->visit(0, parts[part]->size(), [&](const uint8_t* src, size_t count, size_t at) {
+                    equal = equal && std::memcmp(got[part].data() + at, src, count) == 0;
+                    return true;
+                });
+            check(equal, "stream boundary bytes and layer completion unchanged");
+        }
     }
 
     {   // the disk cache's startup guard: a "disk" folder on RAM-backed storage parks conversations IN RAM,

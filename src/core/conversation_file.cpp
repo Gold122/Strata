@@ -619,6 +619,14 @@ public:
         }
         return true;
     }
+    // The next buffered bytes, valid until the next fill. Streaming sinks consume them before advancing;
+    // small format headers and unaligned parts never reach the direct-I/O descriptor as separate reads.
+    const uint8_t* span(size_t& available) {
+        if (at_ == have_ && !fill()) { available = 0; return nullptr; }
+        available = have_ - at_;
+        return buf_.get() + at_;
+    }
+    void consume(size_t n) { at_ += n; }
     // skip n bytes without reading them (a meta read's state arrays): drop the buffer and seek the file
     // to where the caller stands (fill() may have read ahead) plus n; the position total_ tracks is logical
     bool skip(uint64_t n) {
@@ -1424,8 +1432,8 @@ bool restore_meta_impl(const std::string& path, const SessionFileIdentity& id, S
     return true;
 }
 
-// Streaming restore, step 2: walk the meta reading and hashing every byte, keeping nothing, destroy the
-// parse's FileSource, and stream the K/V section into the sinks: file -> one 16 MiB staging block ->
+// Streaming restore, step 2: walk the meta reading and hashing every byte, keeping nothing, then retain
+// the same aligned FileSource and stream its K/V spans into the sinks: file -> one 16 MiB staging block ->
 // hash -> sink.write, sink.done() per layer.  Every layer's 7-field header is checked against its sink
 // before any of that layer's bytes move, and each part's declared length (interleaved in format v1) is
 // checked immediately before that part's bytes.  At the trailer the payload digest and the end marker
@@ -1453,19 +1461,16 @@ bool restore_kv_impl(const std::string& path, const SessionFileIdentity& id,
         // a hand-built sink is a caller bug: refused as invalid, mirroring the source's missing-read guard
         for (const auto& k : sinks)
             if (!k.write || !k.done) { error = "session file: K/V sink is missing write or done"; return false; }   // st.error stays invalid
-        if (!fsrc->skip(0)) { st.error = fsrc->kind(); error = "session file: " + fsrc->error(); return false; }
         hash = in.hash;   // the meta bytes are part of the payload digest
         left = in.left;
     }
-    fsrc.reset();                          // one 16 MiB block serves the whole restore
-    Aligned stage = aligned_block();
-    if (!stage) { st.error = SessionError::memory; error = "session file: out of memory for the read buffer"; return false; }
+    // Keep read-ahead and O_DIRECT: reading the interleaved 56/8-byte headers through RawFile would
+    // hit EINVAL and switch every remaining K/V read to buffered I/O on Linux.
     auto read_block = [&](uint8_t* p, uint64_t n) {
-        while (n) {
-            const long long r = raw.read_some(p, (size_t) std::min<uint64_t>(n, kBlock));
-            if (r == 0) { error = "session file: payload ends early"; return false; }             // invalid
-            if (r < 0) { st.error = raw.kind(); error = "session file: read error: " + raw.error(); return false; }
-            p += r; n -= (uint64_t) r;
+        if (!fsrc->read(p, (size_t) n)) {
+            st.error = fsrc->kind();
+            error = "session file: read error: " + fsrc->error();
+            return false;
         }
         return true;
     };
@@ -1502,17 +1507,21 @@ bool restore_kv_impl(const std::string& path, const SessionFileIdentity& id,
             }
             const uint64_t n = sink.sizes[(size_t) p];
             for (uint64_t at = 0; at < n;) {
-                const uint64_t c = std::min<uint64_t>(n - at, kBlock);
-                if (!read_counted(stage.get(), c)) return false;
-                hash.update(stage.get(), (size_t) c);
-                if (!sink.write((size_t) p, (size_t) at, stage.get(), (size_t) c)) {
+                size_t available = 0;
+                const uint8_t* data = fsrc->span(available);
+                if (!data) { st.error = fsrc->kind(); error = "session file: read error: " + fsrc->error(); return false; }
+                const size_t c = (size_t) std::min<uint64_t>(n - at, available);
+                if (c > left) { error = "session file: payload ends early"; return false; }
+                hash.update(data, c);
+                if (!sink.write((size_t) p, (size_t) at, data, c)) {
                     st.error = SessionError::device;
                     error = "session file: K/V sink write failed" +
                             (sink.error ? std::string(": ") + sink.error() : std::string());
                     return false;
                 }
+                fsrc->consume(c);
+                left -= c;
                 at += c;
-                if (limits.progress) limits.progress(size - kTrailer - left, size);
             }
         }
         if (!sink.done()) {

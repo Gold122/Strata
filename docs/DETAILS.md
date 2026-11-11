@@ -798,6 +798,9 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   RAM accounting to catch up. It trades later prefix-cache hits for room to save and cannot guarantee a save.
 - Clients still send their messages and images; the file holds engine state and token identity, not a chat export. A follow-up
   that continues the restored conversation reuses its state; a short tail may be read again. Only the deepest checkpoint is saved.
+- Streaming disk-cache restores use one aligned 16 MiB transfer buffer, including the small headers between K/V parts.
+  On Linux this keeps direct I/O enabled when the filesystem supports it, rather than filling the file cache with the session.
+  `STRATA_SESSION_BUFFERED=1` forces buffered I/O; unsupported direct I/O also falls back to it. The file format and checksum are unchanged.
 - A file is bound to the model files (sampled by size and first and last MiB, not by path) and to the settings that change what
   the cells mean (engine version, CUDA or HIP, `--kv`, `STRATA_KV_ROT`, `--kv-resident`, `--max-context`, `--mtp-window`, the
   rope configuration, a loaded control vector and the arithmetic switches). Sampling, seeds, draft tuning and the expert
