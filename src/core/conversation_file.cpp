@@ -749,11 +749,12 @@ struct In {
     const SessionReadLimits& limits;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
+    bool hash_payload = true;
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
         if (c && !f->read(p, c)) { kind = f->kind(); return fail("read error: " + f->error()); }
-        hash.update(p, c);
+        if (hash_payload) hash.update(p, c);
         left -= c;
         return true;
     }
@@ -1425,6 +1426,8 @@ bool restore_meta_impl(const std::string& path, const SessionFileIdentity& id, S
     }
     SavedConversation parsed;
     In in{&*fsrc, SessionHasher(0), payload, error, limits};
+    // This first pass does not verify the payload digest; restore_kv hashes every byte again.
+    in.hash_payload = false;
     if (!get_payload_prefix(in, parsed)) { st.error = in.kind; return false; }
     meta = std::move(parsed);
     bytes = (size_t) size;
@@ -1604,6 +1607,7 @@ bool session_file_read_meta(const std::string& path, const SessionFileIdentity& 
     if (!open_and_header(raw, fsrc, path, id, limits, size, payload, error, kind)) return false;
     SessionFileMeta parsed;
     In in{&*fsrc, SessionHasher(0), payload, error, limits};
+    in.hash_payload = false;   // the index reads token metadata only, not a verified payload
     if (!get_meta_payload(in, parsed)) return false;
     out = std::move(parsed);
     return true;

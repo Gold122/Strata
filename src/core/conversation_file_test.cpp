@@ -1131,6 +1131,48 @@ int main() {
         }
     }
 
+    {   // Both metadata passes must agree across hash/read boundaries; only the final K/V pass verifies the digest.
+        for (size_t n : {size_t(0), size_t(1), size_t(65535), size_t(65536), size_t(65537),
+                         (16u << 20) - size_t(17), size_t(16u << 20), (16u << 20) + size_t(17)}) {
+            SavedConversation s;
+            s.geometry = original.geometry;
+            s.layer_hi = 1;
+            s.live.ids = {11, 22, 33};
+            s.live.gdn = bytes_of(n, 71);
+            s.checkpoints.push_back(s.live);
+            s.checkpoints[0].gdn = bytes_of(n, 97);
+            const fs::path p = dir / "meta-boundary.sess";
+            size_t bytes = 0;
+            check(session_file_write(p.string(), s, id, bytes, error), "write metadata boundary sample");
+            SavedConversation restored;
+            size_t count = 0;
+            check(session_file_restore_meta(p.string(), id, restored, count, error, {}) &&
+                  count == bytes && same_checkpoint(restored.live, s.live) && restored.checkpoints.size() == 1 &&
+                  same_checkpoint(restored.checkpoints[0], s.checkpoints[0]), "metadata arrays cross hash and read boundaries");
+            check(session_file_restore_kv(p.string(), id, {}, error, {}), "metadata-only stream verifies full payload digest");
+            SessionFileMeta index;
+            check(session_file_read_meta(p.string(), id, index, error, 100, 1) && index.ids == s.live.ids &&
+                  index.checkpoints.size() == 1 && index.checkpoints[0].ids == s.checkpoints[0].ids,
+                  "index metadata agrees at state boundaries");
+            if (!n) continue;
+            // v1: header, geometry, layer range/cvec, IDs, image count, then GDN length and bytes.
+            const size_t live_gdn = 64 + 18 * 8 + 3 * 8 + 8 + s.live.ids.size() * 4 + 8 + 8;
+            const size_t checkpoint_bytes = 8 + s.live.ids.size() * 4 + 8 + 5 * 8 + n + 8;
+            const auto intact = slurp(p);
+            for (size_t at : {live_gdn, live_gdn + checkpoint_bytes + 8}) {
+                auto corrupt = intact;
+                corrupt[at + n / 2] ^= 0x40;
+                spit(p, corrupt);
+                check(session_file_restore_meta(p.string(), id, restored, count, error, {}),
+                      "metadata pass defers checksum verification as documented");
+                SessionStatus status;
+                check(!session_file_restore_kv(p.string(), id, {}, error, {}, &status) &&
+                      status.error == SessionError::invalid && error.find("checksum") != std::string::npos,
+                      "final pass rejects corruption in live or checkpoint state");
+            }
+        }
+    }
+
     {   // the disk cache's startup guard: a "disk" folder on RAM-backed storage parks conversations IN RAM,
         // and those pages outlive the engine in no process (the exact leak the disk cache exists to avoid)
         const fs::path shm = "/dev/shm";
